@@ -72,6 +72,43 @@ class RafCase {
     return score.clamp(0, 100);
   }
 
+  int get daysOpen => DateTime.now().difference(created).inDays.clamp(0, 9999);
+
+  int get attentionScore {
+    if (status == 'Submitted to RAF') return 0;
+    var score = 100 - readiness;
+    score += daysOpen.clamp(0, 30);
+    if (lawyer == null) score += 20;
+    if (documents.isEmpty) score += 15;
+    return score.clamp(0, 100);
+  }
+
+  Map<String, bool> get evidenceChecklist {
+    final names = documents.join(' ').toLowerCase();
+    bool hasAny(List<String> words) => words.any(names.contains);
+    return {
+      'Identity document': hasAny(['identity', ' id ', 'id.', 'passport']),
+      'Medical records':
+          hasAny(['medical', 'hospital', 'clinical', 'doctor', 'report']),
+      'Accident evidence':
+          hasAny(['accident', 'police', 'crash', 'scene', 'affidavit']),
+      'Consent or mandate':
+          hasAny(['consent', 'mandate', 'authority', 'authorisation']),
+      'Income evidence':
+          hasAny(['income', 'payslip', 'salary', 'employment', 'earnings']),
+    };
+  }
+
+  List<String> get suggestedMissingEvidence => evidenceChecklist.entries
+      .where((entry) => !entry.value)
+      .map((entry) => entry.key)
+      .toList();
+
+  int get evidencePercent {
+    final complete = evidenceChecklist.values.where((value) => value).length;
+    return (complete / evidenceChecklist.length * 100).round();
+  }
+
   String get urgency {
     final age = DateTime.now().difference(created).inDays;
     if (status == 'Submitted to RAF') return 'Filed';
@@ -82,12 +119,17 @@ class RafCase {
   }
 
   String get nextAction {
-    if (documents.isEmpty) return 'Attach accident, hospital, or medical records.';
+    if (documents.isEmpty) {
+      return 'Attach accident, hospital, or medical records.';
+    }
     if (lawyer == null) return 'Assign the best matching RAF lawyer.';
     if (messages.isEmpty) return 'Send the first case handover message.';
-    if (status != 'Submitted to RAF') return 'Review readiness and move toward RAF submission.';
+    if (status != 'Submitted to RAF') {
+      return 'Review readiness and move toward RAF submission.';
+    }
     return 'Monitor response and keep documents updated.';
   }
+
   Map<String, dynamic> toJson() => {
         'id': id,
         'patient': patient,
@@ -161,8 +203,10 @@ class AppStore extends ChangeNotifier {
   bool syncing = false;
   Palette palette = Palette.ocean;
   bool dark = false;
+  bool privacyShield = false;
   final cases = <RafCase>[];
   final notices = <String>[];
+  final followUps = <String, DateTime>{};
   final lawyers = <LawyerInfo>[
     LawyerInfo('Adv. Naledi Jacobs', 'Johannesburg', 12, true, .94),
     LawyerInfo('Mpho Khumalo Attorneys', 'Sandton', 16, true, .91),
@@ -180,8 +224,11 @@ class AppStore extends ChangeNotifier {
         cases.addAll(
             (j['cases'] as List? ?? []).map((e) => RafCase.fromJson(e)));
         notices.addAll(List<String>.from(j['notices'] ?? []));
+        followUps.addAll((j['followUps'] as Map<String, dynamic>? ?? {}).map(
+            (key, value) => MapEntry(key, DateTime.parse(value as String))));
         palette = Palette.values.byName(j['palette'] ?? 'ocean');
         dark = j['dark'] ?? false;
+        privacyShield = j['privacyShield'] ?? false;
       } catch (_) {
         await storage.delete(key: 'health_connect_state');
       }
@@ -202,8 +249,11 @@ class AppStore extends ChangeNotifier {
           'profile': profile?.toJson(),
           'cases': cases.map((e) => e.toJson()).toList(),
           'notices': notices,
+          'followUps': followUps
+              .map((key, value) => MapEntry(key, value.toIso8601String())),
           'palette': palette.name,
           'dark': dark,
+          'privacyShield': privacyShield,
         }));
   }
 
@@ -320,6 +370,39 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  String patientLabel(String name) =>
+      privacyShield ? 'Protected patient' : name;
+
+  Future<void> togglePrivacyShield() async {
+    privacyShield = !privacyShield;
+    notices.insert(0,
+        privacyShield ? 'Privacy shield enabled' : 'Privacy shield disabled');
+    await persist();
+    notifyListeners();
+  }
+
+  Future<void> setFollowUp(RafCase item, DateTime? date) async {
+    if (date == null) {
+      followUps.remove(item.id);
+      notices.insert(0, 'Follow-up cleared for ${item.id}');
+    } else {
+      followUps[item.id] = DateTime(date.year, date.month, date.day);
+      notices.insert(0, 'Follow-up scheduled for ${item.id}');
+    }
+    await persist();
+    notifyListeners();
+  }
+
+  bool followUpOverdue(RafCase item) {
+    final date = followUps[item.id];
+    if (date == null) return false;
+    final today = DateTime.now();
+    return date.isBefore(DateTime(today.year, today.month, today.day));
+  }
+
+  int operationalScore(RafCase item) =>
+      (item.attentionScore + (followUpOverdue(item) ? 25 : 0)).clamp(0, 100);
+
   Future<void> loadRemote(
       {required UserRole roleFallback, Profile? fallback}) async {
     if (!BackendConfig.enabled) return;
@@ -404,8 +487,16 @@ class AppStore extends ChangeNotifier {
     if (lawyer.available) score += 8;
     score += (lawyer.experience.clamp(0, 15) / 3).round();
     score += (lawyer.success * 7).round();
+    score -= lawyerCaseload(lawyer) * 3;
     return score.clamp(0, 99);
   }
+
+  int lawyerCaseload(LawyerInfo lawyer) => cases
+      .where((item) =>
+          item.status != 'Submitted to RAF' &&
+          (item.lawyerId == lawyer.organisationId ||
+              item.lawyer?.toLowerCase() == lawyer.name.toLowerCase()))
+      .length;
 }
 
 class HealthConnectApp extends StatefulWidget {
@@ -652,14 +743,23 @@ class _HomeScreenState extends State<HomeScreen> {
     final wide = MediaQuery.sizeOf(context).width >= 900;
     final pages = [
       Dashboard(widget.store),
+      OperationsPage(widget.store),
       CasesPage(widget.store),
       LawyersPage(widget.store),
       NetworkPage(widget.store),
       MessagesPage(widget.store)
     ];
-    const labels = ['Overview', 'RAF cases', 'Lawyers', 'Network', 'Messages'];
+    const labels = [
+      'Overview',
+      'Operations',
+      'RAF cases',
+      'Lawyers',
+      'Network',
+      'Messages'
+    ];
     const icons = [
       Icons.grid_view_rounded,
+      Icons.radar_rounded,
       Icons.folder_copy_outlined,
       Icons.balance_rounded,
       Icons.domain_rounded,
@@ -766,6 +866,17 @@ class Header extends StatelessWidget {
             onPressed: () => store.theme(isDark: !store.dark),
             icon:
                 Icon(store.dark ? Icons.light_mode : Icons.dark_mode_outlined)),
+        IconButton(
+            tooltip: store.privacyShield
+                ? 'Reveal patient identities'
+                : 'Mask patient identities',
+            onPressed: store.togglePrivacyShield,
+            icon: Icon(store.privacyShield
+                ? Icons.visibility_off
+                : Icons.privacy_tip_outlined),
+            color: store.privacyShield
+                ? Theme.of(context).colorScheme.primary
+                : null),
         PopupMenuButton(
             icon: CircleAvatar(
                 child: Text(store.profile!.name.substring(0, 1).toUpperCase())),
@@ -804,7 +915,11 @@ class Dashboard extends StatelessWidget {
               store.cases.isEmpty
                   ? '0%'
                   : '${(store.cases.map((e) => e.readiness).reduce((a, b) => a + b) / store.cases.length).round()}%',
-              'Avg readiness')
+              'Avg readiness'),
+          Metric(
+              Icons.notification_important_outlined,
+              '${store.cases.where(store.followUpOverdue).length}',
+              'Overdue follow-ups')
         ]),
         const SectionTitle('Recent cases'),
         if (store.cases.isEmpty)
@@ -817,6 +932,274 @@ class Dashboard extends StatelessWidget {
             leading: const CircleAvatar(child: Icon(Icons.notifications_none)),
             title: Text(e))),
       ]);
+}
+
+class OperationsPage extends StatelessWidget {
+  const OperationsPage(this.store, {super.key});
+  final AppStore store;
+
+  @override
+  Widget build(BuildContext context) {
+    final actionable = store.cases
+        .where((item) => item.status != 'Submitted to RAF')
+        .toList()
+      ..sort((a, b) =>
+          store.operationalScore(b).compareTo(store.operationalScore(a)));
+    final uncoveredCities = store.cases
+        .where((item) => item.lawyer == null)
+        .map((item) => item.city)
+        .where((city) => !store.lawyers
+            .any((lawyer) => lawyer.available && lawyer.city == city))
+        .toSet()
+        .toList();
+    final readyCount = store.cases.where((item) => item.readiness >= 80).length;
+
+    return AppList(key: const ValueKey('operations'), children: [
+      const Heading('RAF Operations Centre',
+          'A live command view of priority work, case flow and network coverage.'),
+      OperationsPulse(
+          actionCount:
+              actionable.where((item) => item.attentionScore >= 60).length,
+          readyCount: readyCount,
+          uncoveredCount: uncoveredCities.length),
+      const SectionTitle('Priority action queue'),
+      if (actionable.isEmpty)
+        const EmptyState(Icons.task_alt, 'Action queue is clear',
+            'All current matters have reached the submitted stage.')
+      else
+        ...actionable.take(5).map((item) => Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: ActionQueueCard(store, item))),
+      const SectionTitle('Case flow'),
+      CaseFlowBoard(store.cases),
+      const SectionTitle('Follow-up planner'),
+      FollowUpBoard(store),
+      const SectionTitle('Network coverage radar'),
+      if (uncoveredCities.isEmpty)
+        const CoverageNotice(
+            Icons.hub_outlined,
+            'Coverage looks healthy',
+            'Every unassigned case city has an available local lawyer match.',
+            Colors.green)
+      else
+        CoverageNotice(
+            Icons.location_off_outlined,
+            '${uncoveredCities.length} coverage gap${uncoveredCities.length == 1 ? '' : 's'}',
+            'No available same-city lawyer for: ${uncoveredCities.join(', ')}.',
+            Colors.orange)
+    ]);
+  }
+}
+
+class OperationsPulse extends StatelessWidget {
+  const OperationsPulse(
+      {required this.actionCount,
+      required this.readyCount,
+      required this.uncoveredCount,
+      super.key});
+  final int actionCount, readyCount, uncoveredCount;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Container(
+        padding: const EdgeInsets.all(22),
+        decoration: BoxDecoration(
+            gradient: LinearGradient(colors: [
+              colors.primaryContainer,
+              colors.tertiaryContainer,
+            ]),
+            borderRadius: BorderRadius.circular(26)),
+        child: Wrap(spacing: 28, runSpacing: 18, children: [
+          const SizedBox(
+              width: 230,
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(children: [
+                      Icon(Icons.radar_rounded),
+                      SizedBox(width: 8),
+                      Text('Command pulse',
+                          style: TextStyle(
+                              fontSize: 20, fontWeight: FontWeight.w900))
+                    ]),
+                    SizedBox(height: 6),
+                    Text('Your live RAF workflow health at a glance.')
+                  ])),
+          PulseValue('$actionCount', 'High attention', Icons.priority_high),
+          PulseValue('$readyCount', 'Ready ≥ 80%', Icons.verified_outlined),
+          PulseValue(
+              '$uncoveredCount', 'Coverage gaps', Icons.location_searching)
+        ]));
+  }
+}
+
+class PulseValue extends StatelessWidget {
+  const PulseValue(this.value, this.label, this.icon, {super.key});
+  final String value, label;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+      width: 130,
+      child: Row(children: [
+        CircleAvatar(child: Icon(icon)),
+        const SizedBox(width: 10),
+        Expanded(
+            child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+              Text(value,
+                  style: const TextStyle(
+                      fontSize: 22, fontWeight: FontWeight.w900)),
+              Text(label,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 11))
+            ]))
+      ]));
+}
+
+class ActionQueueCard extends StatelessWidget {
+  const ActionQueueCard(this.store, this.item, {super.key});
+  final AppStore store;
+  final RafCase item;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = CaseCard._urgencyColor(item.urgency);
+    return Card(
+        child: ListTile(
+            contentPadding:
+                const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+            leading: CircleAvatar(
+                backgroundColor: color.withValues(alpha: .14),
+                child: Text('${store.operationalScore(item)}',
+                    style:
+                        TextStyle(color: color, fontWeight: FontWeight.w900))),
+            title: Text(store.patientLabel(item.patient),
+                style: const TextStyle(fontWeight: FontWeight.w900)),
+            subtitle: Text(
+                '${item.nextAction}\n${item.id} · ${item.daysOpen} day${item.daysOpen == 1 ? '' : 's'} in workflow'),
+            isThreeLine: true,
+            trailing: FilledButton.tonalIcon(
+                onPressed: () => showDialog(
+                    context: context, builder: (_) => CaseDetails(store, item)),
+                icon: const Icon(Icons.arrow_forward, size: 17),
+                label: const Text('Open'))));
+  }
+}
+
+class CaseFlowBoard extends StatelessWidget {
+  const CaseFlowBoard(this.cases, {super.key});
+  final List<RafCase> cases;
+
+  @override
+  Widget build(BuildContext context) {
+    const stages = [
+      'New referral',
+      'Awaiting records',
+      'Lawyer matching',
+      'Legal review',
+      'Submitted to RAF'
+    ];
+    return Wrap(
+        spacing: 10,
+        runSpacing: 10,
+        children: stages.map((stage) {
+          final count = cases.where((item) => item.status == stage).length;
+          return Container(
+              width: 180,
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(18)),
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('$count',
+                        style: const TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.w900)),
+                    Text(stage),
+                    const SizedBox(height: 8),
+                    LinearProgressIndicator(
+                        value: cases.isEmpty ? 0 : count / cases.length,
+                        borderRadius: BorderRadius.circular(8))
+                  ]));
+        }).toList());
+  }
+}
+
+class FollowUpBoard extends StatelessWidget {
+  const FollowUpBoard(this.store, {super.key});
+  final AppStore store;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheduled = store.cases
+        .where((item) => store.followUps.containsKey(item.id))
+        .toList()
+      ..sort(
+          (a, b) => store.followUps[a.id]!.compareTo(store.followUps[b.id]!));
+    if (scheduled.isEmpty) {
+      return const CoverageNotice(
+          Icons.event_available_outlined,
+          'No follow-ups scheduled',
+          'Open a case to schedule its next review date.',
+          Colors.blue);
+    }
+    return Column(
+        children: scheduled.take(5).map((item) {
+      final date = store.followUps[item.id]!;
+      final overdue = store.followUpOverdue(item);
+      return ListTile(
+          leading: CircleAvatar(
+              backgroundColor:
+                  (overdue ? Colors.red : Colors.blue).withValues(alpha: .14),
+              child: Icon(overdue ? Icons.event_busy : Icons.event,
+                  color: overdue ? Colors.red : Colors.blue)),
+          title: Text('${item.id} · ${store.patientLabel(item.patient)}',
+              style: const TextStyle(fontWeight: FontWeight.w800)),
+          subtitle: Text(item.nextAction),
+          trailing: Text('${overdue ? 'OVERDUE · ' : ''}${_shortDate(date)}',
+              style: TextStyle(
+                  color: overdue ? Colors.red : null,
+                  fontWeight: FontWeight.w900)));
+    }).toList());
+  }
+
+  static String _shortDate(DateTime date) =>
+      '${date.day.toString().padLeft(2, '0')}/${date.month.toString().padLeft(2, '0')}/${date.year}';
+}
+
+class CoverageNotice extends StatelessWidget {
+  const CoverageNotice(this.icon, this.title, this.detail, this.color,
+      {super.key});
+  final IconData icon;
+  final String title, detail;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) => Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+          color: color.withValues(alpha: .09),
+          border: Border.all(color: color.withValues(alpha: .25)),
+          borderRadius: BorderRadius.circular(20)),
+      child: Row(children: [
+        CircleAvatar(
+            backgroundColor: color.withValues(alpha: .15),
+            child: Icon(icon, color: color)),
+        const SizedBox(width: 14),
+        Expanded(
+            child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+              Text(title, style: const TextStyle(fontWeight: FontWeight.w900)),
+              Text(detail)
+            ]))
+      ]));
 }
 
 class Welcome extends StatelessWidget {
@@ -859,19 +1242,23 @@ class Metric extends StatelessWidget {
   final String value, label;
   @override
   Widget build(BuildContext context) => SizedBox(
-      width: 210,
+      width: 235,
       child: Card(
           child: Padding(
               padding: const EdgeInsets.all(18),
               child: Row(children: [
                 CircleAvatar(child: Icon(icon)),
                 const SizedBox(width: 14),
-                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text(value,
-                      style: const TextStyle(
-                          fontSize: 24, fontWeight: FontWeight.w900)),
-                  Text(label)
-                ])
+                Expanded(
+                    child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                      Text(value,
+                          style: const TextStyle(
+                              fontSize: 24, fontWeight: FontWeight.w900)),
+                      Text(label, maxLines: 2, overflow: TextOverflow.ellipsis)
+                    ]))
               ]))));
 }
 
@@ -966,36 +1353,73 @@ class CaseCard extends StatelessWidget {
   final AppStore store;
   final RafCase item;
   @override
-  Widget build(BuildContext context) => Card(
-      child: InkWell(
-          borderRadius: BorderRadius.circular(22),
-          onTap: () => showDialog(
-              context: context, builder: (_) => CaseDetails(store, item)),
-          child: Padding(
-              padding: const EdgeInsets.all(18),
-              child: Row(children: [
-                Container(
-                    width: 9,
-                    height: 55,
-                    decoration: BoxDecoration(
-                        color: Theme.of(context).colorScheme.primary,
-                        borderRadius: BorderRadius.circular(8))),
-                const SizedBox(width: 14),
-                Expanded(
-                    child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                      Text(item.patient,
-                          style: const TextStyle(
-                              fontSize: 16, fontWeight: FontWeight.w900)),
-                      Text('${item.id} · ${item.city}',
-                          style: const TextStyle(color: Colors.grey)),
-                      Text(item.lawyer ?? 'No lawyer assigned',
-                          style: const TextStyle(fontSize: 12))
-                    ])),
-                Chip(label: Text(item.status)),
-                const Icon(Icons.chevron_right)
-              ]))));
+  Widget build(BuildContext context) {
+    final urgencyColor = _urgencyColor(item.urgency);
+    return Card(
+        child: InkWell(
+            borderRadius: BorderRadius.circular(22),
+            onTap: () => showDialog(
+                context: context, builder: (_) => CaseDetails(store, item)),
+            child: Padding(
+                padding: const EdgeInsets.all(18),
+                child: Row(children: [
+                  Container(
+                      width: 9,
+                      height: 55,
+                      decoration: BoxDecoration(
+                          color: urgencyColor,
+                          borderRadius: BorderRadius.circular(8))),
+                  const SizedBox(width: 14),
+                  Expanded(
+                      child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                        Text(store.patientLabel(item.patient),
+                            style: const TextStyle(
+                                fontSize: 16, fontWeight: FontWeight.w900)),
+                        Text('${item.id} · ${item.city}',
+                            style: const TextStyle(color: Colors.grey)),
+                        Text(item.lawyer ?? 'No lawyer assigned',
+                            style: const TextStyle(fontSize: 12)),
+                        const SizedBox(height: 8),
+                        Row(children: [
+                          Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(
+                                  color: urgencyColor.withValues(alpha: .12),
+                                  borderRadius: BorderRadius.circular(20)),
+                              child: Text(item.urgency,
+                                  style: TextStyle(
+                                      color: urgencyColor,
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w800))),
+                          const SizedBox(width: 10),
+                          Text('${item.readiness}% ready',
+                              style: const TextStyle(
+                                  fontSize: 11, fontWeight: FontWeight.w700))
+                        ])
+                      ])),
+                  Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                    Chip(label: Text(item.status)),
+                    SizedBox(
+                        width: 92,
+                        child: LinearProgressIndicator(
+                            value: item.readiness / 100,
+                            color: urgencyColor,
+                            borderRadius: BorderRadius.circular(8)))
+                  ]),
+                  const Icon(Icons.chevron_right)
+                ]))));
+  }
+
+  static Color _urgencyColor(String urgency) => switch (urgency) {
+        'High attention' => Colors.red,
+        'Needs records' => Colors.orange,
+        'Needs lawyer' => Colors.amber.shade800,
+        'Filed' => Colors.blue,
+        _ => Colors.green,
+      };
 }
 
 class CaseDetails extends StatefulWidget {
@@ -1009,7 +1433,14 @@ class CaseDetails extends StatefulWidget {
 class _CaseDetailsState extends State<CaseDetails> {
   @override
   Widget build(BuildContext context) => AlertDialog(
-          title: Text(widget.item.patient),
+          title: Row(children: [
+            Expanded(
+                child: Text(widget.store.patientLabel(widget.item.patient))),
+            if (widget.store.privacyShield)
+              const Tooltip(
+                  message: 'Patient identity is masked',
+                  child: Icon(Icons.visibility_off, size: 20))
+          ]),
           content: SizedBox(
               width: 560,
               child: SingleChildScrollView(
@@ -1018,6 +1449,8 @@ class _CaseDetailsState extends State<CaseDetails> {
                       children: [
                     Text(
                         '${widget.item.id} · ${widget.item.hospital} · ${widget.item.city}'),
+                    const SizedBox(height: 18),
+                    SmartCaseInsight(widget.item),
                     const SizedBox(height: 18),
                     DropdownButtonFormField<String>(
                         initialValue: widget.item.status,
@@ -1039,9 +1472,15 @@ class _CaseDetailsState extends State<CaseDetails> {
                           await widget.store.updateCase(
                               widget.item, '${widget.item.id} moved to $v');
                         }),
+                    const SizedBox(height: 12),
+                    FollowUpControl(widget.store, widget.item, scheduleFollowUp,
+                        clearFollowUp),
                     const SizedBox(height: 18),
                     const Text('Documents',
                         style: TextStyle(fontWeight: FontWeight.w900)),
+                    const SizedBox(height: 8),
+                    EvidencePackAssistant(widget.item),
+                    const SizedBox(height: 8),
                     ...widget.item.documents.map((e) => ListTile(
                         leading: const Icon(Icons.description_outlined),
                         title: Text(e))),
@@ -1056,7 +1495,8 @@ class _CaseDetailsState extends State<CaseDetails> {
                     const SizedBox(height: 18),
                     const Text('Case timeline',
                         style: TextStyle(fontWeight: FontWeight.w900)),
-                    TimelineList(widget.item.timeline),
+                    TimelineList(widget.item.timeline,
+                        redactDetails: widget.store.privacyShield),
                   ]))),
           actions: [
             OutlinedButton.icon(
@@ -1082,13 +1522,33 @@ class _CaseDetailsState extends State<CaseDetails> {
     }
   }
 
+  Future<void> scheduleFollowUp() async {
+    final existing = widget.store.followUps[widget.item.id];
+    final now = DateTime.now();
+    final selected = await showDatePicker(
+        context: context,
+        initialDate: existing ?? now.add(const Duration(days: 7)),
+        firstDate: DateTime(2000),
+        lastDate: DateTime(now.year + 5),
+        helpText: 'Schedule case follow-up');
+    if (selected != null) {
+      await widget.store.setFollowUp(widget.item, selected);
+      if (mounted) setState(() {});
+    }
+  }
+
+  Future<void> clearFollowUp() async {
+    await widget.store.setFollowUp(widget.item, null);
+    if (mounted) setState(() {});
+  }
+
   Future<void> copySummary() async {
     final item = widget.item;
     final summary = [
       'Health Connect RAF Case Summary',
       '',
       'Reference: ${item.id}',
-      'Patient: ${item.patient}',
+      'Patient: ${widget.store.patientLabel(item.patient)}',
       'Hospital: ${item.hospital}',
       'Accident location: ${item.city}',
       'Current status: ${item.status}',
@@ -1100,6 +1560,14 @@ class _CaseDetailsState extends State<CaseDetails> {
         '- None attached yet'
       else
         ...item.documents.map((document) => '- $document'),
+      '',
+      'Suggested evidence review:',
+      'Evidence detected: ${item.evidencePercent}%',
+      if (item.suggestedMissingEvidence.isEmpty)
+        '- No suggested gaps detected from filenames'
+      else
+        ...item.suggestedMissingEvidence
+            .map((document) => '- Review: $document'),
       '',
       'Latest messages:',
       if (item.messages.isEmpty)
@@ -1131,9 +1599,152 @@ class _CaseDetailsState extends State<CaseDetails> {
       '${value.year}-${value.month.toString().padLeft(2, '0')}-${value.day.toString().padLeft(2, '0')} ${value.hour.toString().padLeft(2, '0')}:${value.minute.toString().padLeft(2, '0')}';
 }
 
+class FollowUpControl extends StatelessWidget {
+  const FollowUpControl(this.store, this.item, this.onSchedule, this.onClear,
+      {super.key});
+  final AppStore store;
+  final RafCase item;
+  final Future<void> Function() onSchedule;
+  final Future<void> Function() onClear;
+
+  @override
+  Widget build(BuildContext context) {
+    final date = store.followUps[item.id];
+    final overdue = store.followUpOverdue(item);
+    return Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+            color:
+                (overdue ? Colors.red : Theme.of(context).colorScheme.primary)
+                    .withValues(alpha: .08),
+            borderRadius: BorderRadius.circular(16)),
+        child: Row(children: [
+          Icon(overdue ? Icons.event_busy : Icons.event_outlined,
+              color: overdue ? Colors.red : null),
+          const SizedBox(width: 10),
+          Expanded(
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                Text(overdue ? 'Follow-up overdue' : 'Next follow-up',
+                    style: const TextStyle(fontWeight: FontWeight.w900)),
+                Text(date == null
+                    ? 'No review date scheduled'
+                    : '${date.day.toString().padLeft(2, '0')}/${date.month.toString().padLeft(2, '0')}/${date.year}')
+              ])),
+          if (date != null)
+            IconButton(
+                tooltip: 'Clear follow-up',
+                onPressed: onClear,
+                icon: const Icon(Icons.close)),
+          TextButton.icon(
+              onPressed: onSchedule,
+              icon: const Icon(Icons.edit_calendar_outlined),
+              label: Text(date == null ? 'Schedule' : 'Change'))
+        ]));
+  }
+}
+
+class SmartCaseInsight extends StatelessWidget {
+  const SmartCaseInsight(this.item, {super.key});
+  final RafCase item;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = CaseCard._urgencyColor(item.urgency);
+    return Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+            color: color.withValues(alpha: .08),
+            border: Border.all(color: color.withValues(alpha: .25)),
+            borderRadius: BorderRadius.circular(18)),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Icon(Icons.auto_awesome, color: color),
+            const SizedBox(width: 8),
+            const Expanded(
+                child: Text('Smart RAF insight',
+                    style: TextStyle(fontWeight: FontWeight.w900))),
+            Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                    color: color.withValues(alpha: .14),
+                    borderRadius: BorderRadius.circular(20)),
+                child: Text(item.urgency,
+                    style: TextStyle(
+                        color: color,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w800)))
+          ]),
+          const SizedBox(height: 14),
+          Text('${item.readiness}% case readiness',
+              style:
+                  const TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+          const SizedBox(height: 7),
+          LinearProgressIndicator(
+              value: item.readiness / 100,
+              minHeight: 8,
+              color: color,
+              borderRadius: BorderRadius.circular(8)),
+          const SizedBox(height: 14),
+          const Text('Next best action',
+              style: TextStyle(fontWeight: FontWeight.w800)),
+          const SizedBox(height: 3),
+          Text(item.nextAction)
+        ]));
+  }
+}
+
+class EvidencePackAssistant extends StatelessWidget {
+  const EvidencePackAssistant(this.item, {super.key});
+  final RafCase item;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+            color: colors.secondaryContainer.withValues(alpha: .45),
+            borderRadius: BorderRadius.circular(16)),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            const Icon(Icons.fact_check_outlined),
+            const SizedBox(width: 8),
+            const Expanded(
+                child: Text('Evidence-pack assistant',
+                    style: TextStyle(fontWeight: FontWeight.w900))),
+            Text('${item.evidencePercent}%',
+                style: const TextStyle(fontWeight: FontWeight.w900))
+          ]),
+          const SizedBox(height: 6),
+          const Text(
+              'Suggested review based on attached filenames—not legal advice.',
+              style: TextStyle(fontSize: 11, color: Colors.grey)),
+          const SizedBox(height: 10),
+          Wrap(
+              spacing: 7,
+              runSpacing: 7,
+              children: item.evidenceChecklist.entries
+                  .map((entry) => Chip(
+                      avatar: Icon(
+                          entry.value
+                              ? Icons.check_circle
+                              : Icons.radio_button_unchecked,
+                          size: 17,
+                          color: entry.value ? Colors.green : Colors.orange),
+                      label: Text(entry.key,
+                          style: const TextStyle(fontSize: 11))))
+                  .toList())
+        ]));
+  }
+}
+
 class TimelineList extends StatelessWidget {
-  const TimelineList(this.events, {super.key});
+  const TimelineList(this.events, {this.redactDetails = false, super.key});
   final List<TimelineEvent> events;
+  final bool redactDetails;
 
   @override
   Widget build(BuildContext context) {
@@ -1153,7 +1764,8 @@ class TimelineList extends StatelessWidget {
                       CircleAvatar(child: Icon(_iconFor(event.icon), size: 18)),
                   title: Text(event.title,
                       style: const TextStyle(fontWeight: FontWeight.w700)),
-                  subtitle: Text(event.detail),
+                  subtitle:
+                      Text(redactDetails ? 'Details protected' : event.detail),
                   trailing: Text(_timeLabel(event.time),
                       style: const TextStyle(fontSize: 11, color: Colors.grey)),
                 ))
@@ -1203,6 +1815,8 @@ class LawyerCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final score = store.match(lawyer, city);
+    final caseload = store.lawyerCaseload(lawyer);
+    final load = (caseload / 8).clamp(0.0, 1.0);
     return Card(
         child: Padding(
             padding: const EdgeInsets.all(18),
@@ -1225,7 +1839,17 @@ class LawyerCard extends StatelessWidget {
                         style: TextStyle(
                             color: lawyer.available
                                 ? Colors.green
-                                : Colors.orange))
+                                : Colors.orange)),
+                    const SizedBox(height: 6),
+                    Row(children: [
+                      Expanded(
+                          child: LinearProgressIndicator(
+                              value: load,
+                              borderRadius: BorderRadius.circular(8))),
+                      const SizedBox(width: 8),
+                      Text('$caseload active',
+                          style: const TextStyle(fontSize: 11))
+                    ])
                   ])),
               Column(children: [
                 Text('$score%',
@@ -1260,7 +1884,7 @@ class LawyerCard extends StatelessWidget {
                           c, '${lawyer.name} assigned to ${c.id}');
                       if (context.mounted) Navigator.pop(context);
                     },
-                    child: Text('${c.id} · ${c.patient}')))
+                    child: Text('${c.id} · ${store.patientLabel(c.patient)}')))
                 .toList()));
   }
 }
@@ -1383,7 +2007,7 @@ class MessagesPage extends StatelessWidget {
           ...store.cases.map((c) => ListTile(
               leading:
                   const CircleAvatar(child: Icon(Icons.chat_bubble_outline)),
-              title: Text('${c.id} · ${c.patient}'),
+              title: Text('${c.id} · ${store.patientLabel(c.patient)}'),
               subtitle: Text(c.messages.isEmpty
                   ? 'No messages yet'
                   : c.messages.last.text),
