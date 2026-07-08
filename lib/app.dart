@@ -3,10 +3,11 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'backend_config.dart';
 import 'supabase_service.dart';
 
-enum UserRole { hospital, lawyer }
+enum UserRole { hospital, lawyer, patient, admin }
 
 enum Palette { ocean, coral, violet }
 
@@ -17,17 +18,20 @@ class Profile {
       required this.role,
       required this.organisation,
       required this.city,
-      this.verified = false});
+      this.verified = false,
+      this.platformAdmin = false});
   final String name, email, organisation, city;
   final UserRole role;
   final bool verified;
+  final bool platformAdmin;
   Map<String, dynamic> toJson() => {
         'name': name,
         'email': email,
         'role': role.name,
         'organisation': organisation,
         'city': city,
-        'verified': verified
+        'verified': verified,
+        'platformAdmin': platformAdmin
       };
   factory Profile.fromJson(Map<String, dynamic> j) => Profile(
       name: j['name'],
@@ -35,7 +39,8 @@ class Profile {
       role: UserRole.values.byName(j['role']),
       organisation: j['organisation'],
       city: j['city'],
-      verified: j['verified'] ?? false);
+      verified: j['verified'] ?? false,
+      platformAdmin: j['platformAdmin'] ?? false);
 }
 
 class RafCase {
@@ -48,16 +53,35 @@ class RafCase {
       required this.created,
       this.lawyer,
       this.lawyerId,
+      this.patientEmail,
+      this.patientPhone,
+      this.patientIdNumber,
+      this.patientDateOfBirth,
+      this.patientAddress,
+      this.emergencyContactName,
+      this.emergencyContactPhone,
+      this.accidentDate,
+      this.accidentDescription,
       List<String>? documents,
       List<ChatMessage>? messages,
       List<TimelineEvent>? timeline})
       : documents = documents ?? [],
         messages = messages ?? [],
         timeline = timeline ?? [];
-  final String id, patient, hospital, city;
+  final String id, hospital;
+  String patient, city;
   String status;
   String? lawyer;
   String? lawyerId;
+  String? patientEmail;
+  String? patientPhone;
+  String? patientIdNumber;
+  DateTime? patientDateOfBirth;
+  String? patientAddress;
+  String? emergencyContactName;
+  String? emergencyContactPhone;
+  DateTime? accidentDate;
+  String? accidentDescription;
   final DateTime created;
   final List<String> documents;
   final List<ChatMessage> messages;
@@ -138,6 +162,15 @@ class RafCase {
         'status': status,
         'lawyer': lawyer,
         'lawyerId': lawyerId,
+        'patientEmail': patientEmail,
+        'patientPhone': patientPhone,
+        'patientIdNumber': patientIdNumber,
+        'patientDateOfBirth': patientDateOfBirth?.toIso8601String(),
+        'patientAddress': patientAddress,
+        'emergencyContactName': emergencyContactName,
+        'emergencyContactPhone': emergencyContactPhone,
+        'accidentDate': accidentDate?.toIso8601String(),
+        'accidentDescription': accidentDescription,
         'created': created.toIso8601String(),
         'documents': documents,
         'messages': messages.map((e) => e.toJson()).toList(),
@@ -151,6 +184,18 @@ class RafCase {
       status: j['status'],
       lawyer: j['lawyer'],
       lawyerId: j['lawyerId'],
+      patientEmail: j['patientEmail'],
+      patientPhone: j['patientPhone'],
+      patientIdNumber: j['patientIdNumber'],
+      patientDateOfBirth: j['patientDateOfBirth'] == null
+          ? null
+          : DateTime.parse(j['patientDateOfBirth']),
+      patientAddress: j['patientAddress'],
+      emergencyContactName: j['emergencyContactName'],
+      emergencyContactPhone: j['emergencyContactPhone'],
+      accidentDate:
+          j['accidentDate'] == null ? null : DateTime.parse(j['accidentDate']),
+      accidentDescription: j['accidentDescription'],
       created: DateTime.parse(j['created']),
       documents: List<String>.from(j['documents'] ?? []),
       messages: (j['messages'] as List? ?? [])
@@ -207,6 +252,7 @@ class AppStore extends ChangeNotifier {
   final cases = <RafCase>[];
   final notices = <String>[];
   final followUps = <String, DateTime>{};
+  final completedEvidence = <String, Set<String>>{};
   final lawyers = <LawyerInfo>[
     LawyerInfo('Adv. Naledi Jacobs', 'Johannesburg', 12, true, .94),
     LawyerInfo('Mpho Khumalo Attorneys', 'Sandton', 16, true, .91),
@@ -226,6 +272,10 @@ class AppStore extends ChangeNotifier {
         notices.addAll(List<String>.from(j['notices'] ?? []));
         followUps.addAll((j['followUps'] as Map<String, dynamic>? ?? {}).map(
             (key, value) => MapEntry(key, DateTime.parse(value as String))));
+        completedEvidence.addAll(
+            (j['completedEvidence'] as Map<String, dynamic>? ?? {}).map(
+                (key, value) =>
+                    MapEntry(key, Set<String>.from(value as List))));
         palette = Palette.values.byName(j['palette'] ?? 'ocean');
         dark = j['dark'] ?? false;
         privacyShield = j['privacyShield'] ?? false;
@@ -239,6 +289,7 @@ class AppStore extends ChangeNotifier {
           roleFallback: profile?.role ?? UserRole.hospital, fallback: profile);
     }
     ready = true;
+    _refreshDueNotifications();
     notifyListeners();
   }
 
@@ -251,6 +302,8 @@ class AppStore extends ChangeNotifier {
           'notices': notices,
           'followUps': followUps
               .map((key, value) => MapEntry(key, value.toIso8601String())),
+          'completedEvidence': completedEvidence
+              .map((key, value) => MapEntry(key, value.toList())),
           'palette': palette.name,
           'dark': dark,
           'privacyShield': privacyShield,
@@ -261,18 +314,29 @@ class AppStore extends ChangeNotifier {
     if (BackendConfig.enabled) {
       await SupabaseService.signIn(email: email, password: password);
       await loadRemote(roleFallback: role);
+      if (role == UserRole.admin && profile?.platformAdmin != true) {
+        await SupabaseService.signOut();
+        profile = null;
+        throw Exception('This account is not an approved administrator.');
+      }
       notices.insert(0, 'Signed in securely as ${profile!.organisation}');
       await persist();
       notifyListeners();
       return;
     }
     profile = Profile(
-        name: role == UserRole.hospital ? 'Nomsa Mthembu' : 'Naledi Jacobs',
+        name: role == UserRole.hospital
+            ? 'Nomsa Mthembu'
+            : role == UserRole.patient
+                ? 'Patient User'
+                : 'Naledi Jacobs',
         email: email,
         role: role,
         organisation: role == UserRole.hospital
             ? 'Ubuntu Regional Hospital'
-            : 'Jacobs Legal Care',
+            : role == UserRole.patient
+                ? 'Patient account'
+                : 'Jacobs Legal Care',
         city: 'Johannesburg');
     notices.insert(0, 'Signed in securely as ${profile!.organisation}');
     await persist();
@@ -338,7 +402,16 @@ class AppStore extends ChangeNotifier {
           city: value.city,
           status: value.status,
           lawyerName: value.lawyer,
-          lawyerId: value.lawyerId);
+          lawyerId: value.lawyerId,
+          patientEmail: value.patientEmail,
+          patientPhone: value.patientPhone,
+          patientIdNumber: value.patientIdNumber,
+          patientDateOfBirth: value.patientDateOfBirth,
+          patientAddress: value.patientAddress,
+          emergencyContactName: value.emergencyContactName,
+          emergencyContactPhone: value.emergencyContactPhone,
+          accidentDate: value.accidentDate,
+          accidentDescription: value.accidentDescription);
       await loadRemote(roleFallback: profile!.role);
     }
     await persist();
@@ -356,7 +429,23 @@ class AppStore extends ChangeNotifier {
           city: value.city,
           status: value.status,
           lawyerName: value.lawyer,
-          lawyerId: value.lawyerId);
+          lawyerId: value.lawyerId,
+          patientEmail: value.patientEmail,
+          patientPhone: value.patientPhone,
+          patientIdNumber: value.patientIdNumber,
+          patientDateOfBirth: value.patientDateOfBirth,
+          patientAddress: value.patientAddress,
+          emergencyContactName: value.emergencyContactName,
+          emergencyContactPhone: value.emergencyContactPhone,
+          accidentDate: value.accidentDate,
+          accidentDescription: value.accidentDescription);
+      if (notice.toLowerCase().contains('assigned')) {
+        await SupabaseService.notifyCase(
+            caseId: value.id,
+            type: 'assignment',
+            title: 'New lawyer assignment',
+            body: notice);
+      }
       await loadRemote(roleFallback: profile!.role);
     }
     await persist();
@@ -390,7 +479,15 @@ class AppStore extends ChangeNotifier {
       notices.insert(0, 'Follow-up scheduled for ${item.id}');
     }
     await persist();
+    _refreshDueNotifications();
     notifyListeners();
+  }
+
+  void _refreshDueNotifications() {
+    for (final item in cases.where(followUpOverdue)) {
+      final message = 'Follow-up overdue for ${item.id}';
+      if (!notices.contains(message)) notices.insert(0, message);
+    }
   }
 
   bool followUpOverdue(RafCase item) {
@@ -403,13 +500,41 @@ class AppStore extends ChangeNotifier {
   int operationalScore(RafCase item) =>
       (item.attentionScore + (followUpOverdue(item) ? 25 : 0)).clamp(0, 100);
 
+  bool evidenceComplete(RafCase item, String label) =>
+      item.evidenceChecklist[label] == true ||
+      (completedEvidence[item.id]?.contains(label) ?? false);
+
+  int evidenceCompletion(RafCase item) {
+    final labels = item.evidenceChecklist.keys;
+    final complete =
+        labels.where((label) => evidenceComplete(item, label)).length;
+    return (complete / labels.length * 100).round();
+  }
+
+  List<String> missingEvidence(RafCase item) => item.evidenceChecklist.keys
+      .where((label) => !evidenceComplete(item, label))
+      .toList();
+
+  Future<void> setEvidenceComplete(
+      RafCase item, String label, bool complete) async {
+    final values = completedEvidence.putIfAbsent(item.id, () => <String>{});
+    complete ? values.add(label) : values.remove(label);
+    notices.insert(
+        0, '$label ${complete ? 'completed' : 'reopened'} for ${item.id}');
+    await persist();
+    notifyListeners();
+  }
+
   Future<void> loadRemote(
       {required UserRole roleFallback, Profile? fallback}) async {
     if (!BackendConfig.enabled) return;
 
     final organisation = await SupabaseService.currentOrganisation();
     if (organisation != null) {
-      final roleName = organisation['type'] as String? ?? roleFallback.name;
+      final isAdmin = organisation['is_platform_admin'] as bool? ?? false;
+      final roleName = isAdmin && roleFallback == UserRole.admin
+          ? 'admin'
+          : organisation['type'] as String? ?? roleFallback.name;
       profile = Profile(
         name: (organisation['display_name'] as String?) ??
             fallback?.name ??
@@ -419,6 +544,7 @@ class AppStore extends ChangeNotifier {
         organisation: organisation['name'] as String,
         city: organisation['city'] as String,
         verified: organisation['verified'] as bool? ?? false,
+        platformAdmin: isAdmin,
       );
     } else if (fallback != null) {
       profile = fallback;
@@ -461,6 +587,19 @@ class AppStore extends ChangeNotifier {
           status: row['status'] as String,
           lawyer: lawyerName,
           lawyerId: row['assigned_lawyer_id'] as String?,
+          patientEmail: row['patient_email'] as String?,
+          patientPhone: row['patient_phone'] as String?,
+          patientIdNumber: row['patient_id_number'] as String?,
+          patientDateOfBirth: row['patient_date_of_birth'] == null
+              ? null
+              : DateTime.parse(row['patient_date_of_birth'] as String),
+          patientAddress: row['patient_address'] as String?,
+          emergencyContactName: row['emergency_contact_name'] as String?,
+          emergencyContactPhone: row['emergency_contact_phone'] as String?,
+          accidentDate: row['accident_date'] == null
+              ? null
+              : DateTime.parse(row['accident_date'] as String),
+          accidentDescription: row['accident_description'] as String?,
           created: created,
           documents: documents,
           messages: messages,
@@ -569,6 +708,7 @@ class AuthScreen extends StatefulWidget {
 class _AuthScreenState extends State<AuthScreen> {
   bool register = false, loading = false;
   UserRole role = UserRole.hospital;
+  final professionalDocs = <PlatformFile>[];
   final name = TextEditingController(),
       email = TextEditingController(),
       password = TextEditingController(),
@@ -604,21 +744,33 @@ class _AuthScreenState extends State<AuthScreen> {
                                             fontWeight: FontWeight.w900)),
                                     Text(
                                         register
-                                            ? 'Register your verified care organisation.'
-                                            : 'Secure access for hospitals and legal teams.',
+                                            ? role == UserRole.patient
+                                                ? 'Create secure access to your RAF case.'
+                                                : 'Register your verified care organisation.'
+                                            : 'Secure access for hospitals, patients and legal teams.',
                                         style: const TextStyle(
                                             color: Colors.grey)),
                                     const SizedBox(height: 20),
                                     SegmentedButton<UserRole>(
-                                        segments: const [
-                                          ButtonSegment(
+                                        segments: [
+                                          const ButtonSegment(
                                               value: UserRole.hospital,
                                               icon: Icon(Icons.local_hospital),
                                               label: Text('Hospital')),
-                                          ButtonSegment(
+                                          const ButtonSegment(
                                               value: UserRole.lawyer,
                                               icon: Icon(Icons.balance),
-                                              label: Text('Lawyer'))
+                                              label: Text('Lawyer')),
+                                          const ButtonSegment(
+                                              value: UserRole.patient,
+                                              icon: Icon(Icons.person),
+                                              label: Text('Patient')),
+                                          if (!register)
+                                            const ButtonSegment(
+                                                value: UserRole.admin,
+                                                icon: Icon(
+                                                    Icons.admin_panel_settings),
+                                                label: Text('Admin'))
                                         ],
                                         selected: {
                                           role
@@ -633,21 +785,50 @@ class _AuthScreenState extends State<AuthScreen> {
                                               labelText: 'Full name'),
                                           validator: required),
                                       const SizedBox(height: 12),
-                                      TextFormField(
-                                          controller: organisation,
-                                          decoration: InputDecoration(
-                                              labelText:
-                                                  role == UserRole.hospital
-                                                      ? 'Hospital name'
-                                                      : 'Legal practice'),
-                                          validator: required),
-                                      const SizedBox(height: 12),
+                                      if (role != UserRole.patient) ...[
+                                        TextFormField(
+                                            controller: organisation,
+                                            decoration: InputDecoration(
+                                                labelText:
+                                                    role == UserRole.hospital
+                                                        ? 'Hospital name'
+                                                        : 'Legal practice'),
+                                            validator: required),
+                                        const SizedBox(height: 12),
+                                      ],
                                       TextFormField(
                                           controller: city,
                                           decoration: const InputDecoration(
                                               labelText:
                                                   'City / service location'),
-                                          validator: required)
+                                          validator: required),
+                                      if (role != UserRole.patient) ...[
+                                        const SizedBox(height: 12),
+                                        OutlinedButton.icon(
+                                            onPressed: pickProfessionalDocs,
+                                            icon: const Icon(Icons.badge),
+                                            label: Text(professionalDocs.isEmpty
+                                                ? 'Attach approval documents'
+                                                : 'Add more approval documents')),
+                                      ],
+                                      if (role != UserRole.patient &&
+                                          professionalDocs.isNotEmpty) ...[
+                                        const SizedBox(height: 8),
+                                        ...professionalDocs.map((file) =>
+                                            ListTile(
+                                                dense: true,
+                                                contentPadding: EdgeInsets.zero,
+                                                leading: const Icon(
+                                                    Icons.description_outlined),
+                                                title: Text(file.name),
+                                                trailing: IconButton(
+                                                    tooltip: 'Remove',
+                                                    onPressed: () => setState(
+                                                        () => professionalDocs
+                                                            .remove(file)),
+                                                    icon: const Icon(
+                                                        Icons.close))))
+                                      ]
                                     ],
                                     const SizedBox(height: 12),
                                     TextFormField(
@@ -677,14 +858,21 @@ class _AuthScreenState extends State<AuthScreen> {
                                             child: Text(loading
                                                 ? 'Please wait…'
                                                 : register
-                                                    ? 'Register organisation'
+                                                    ? role == UserRole.patient
+                                                        ? 'Register patient'
+                                                        : 'Register organisation'
                                                     : 'Sign in'))),
                                     TextButton(
-                                        onPressed: () => setState(
-                                            () => register = !register),
+                                        onPressed: () => setState(() {
+                                              register = !register;
+                                              if (register &&
+                                                  role == UserRole.admin) {
+                                                role = UserRole.hospital;
+                                              }
+                                            }),
                                         child: Text(register
                                             ? 'Already registered? Sign in'
-                                            : 'New organisation? Register')),
+                                            : 'New here? Register')),
                                     Text(
                                         BackendConfig.enabled
                                             ? 'Connected to Supabase secure backend.'
@@ -695,6 +883,13 @@ class _AuthScreenState extends State<AuthScreen> {
                                   ]))))))));
   static String? required(String? v) =>
       (v ?? '').trim().isEmpty ? 'Required' : null;
+  Future<void> pickProfessionalDocs() async {
+    final result = await FilePicker.platform
+        .pickFiles(allowMultiple: true, withData: BackendConfig.enabled);
+    if (result == null) return;
+    setState(() => professionalDocs.addAll(result.files));
+  }
+
   Future<void> submit() async {
     if (!form.currentState!.validate()) return;
     setState(() => loading = true);
@@ -706,12 +901,25 @@ class _AuthScreenState extends State<AuthScreen> {
                 name: name.text.trim(),
                 email: email.text.trim(),
                 role: role,
-                organisation: organisation.text.trim(),
+                organisation: role == UserRole.patient
+                    ? 'Patient account'
+                    : organisation.text.trim(),
                 city: city.text.trim(),
               ),
               password.text,
             )
             .timeout(const Duration(seconds: 25));
+        if (BackendConfig.enabled && role != UserRole.patient) {
+          for (final file in professionalDocs) {
+            if (file.bytes == null) continue;
+            await SupabaseService.uploadProfessionalDocument(
+                fileName: file.name,
+                bytes: file.bytes!,
+                category: role == UserRole.hospital
+                    ? 'Hospital approval'
+                    : 'Law practice approval');
+          }
+        }
       } else {
         await widget.store
             .signIn(email.text.trim(), password.text, role)
@@ -741,30 +949,50 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     final wide = MediaQuery.sizeOf(context).width >= 900;
-    final pages = [
-      Dashboard(widget.store),
-      OperationsPage(widget.store),
-      CasesPage(widget.store),
-      LawyersPage(widget.store),
-      NetworkPage(widget.store),
-      MessagesPage(widget.store)
-    ];
-    const labels = [
-      'Overview',
-      'Operations',
-      'RAF cases',
-      'Lawyers',
-      'Network',
-      'Messages'
-    ];
-    const icons = [
-      Icons.grid_view_rounded,
-      Icons.radar_rounded,
-      Icons.folder_copy_outlined,
-      Icons.balance_rounded,
-      Icons.domain_rounded,
-      Icons.chat_bubble_outline
-    ];
+    final isPatient = widget.store.profile!.role == UserRole.patient;
+    final pages = isPatient
+        ? [
+            Dashboard(widget.store),
+            CasesPage(widget.store),
+            MessagesPage(widget.store)
+          ]
+        : [
+            Dashboard(widget.store),
+            OperationsPage(widget.store),
+            CasesPage(widget.store),
+            LawyersPage(widget.store),
+            NetworkPage(widget.store),
+            MessagesPage(widget.store)
+          ];
+    final labels = isPatient
+        ? <String>['Overview', 'My RAF case', 'Messages']
+        : <String>[
+            'Overview',
+            'Operations',
+            'RAF cases',
+            'Lawyers',
+            'Network',
+            'Messages'
+          ];
+    final icons = isPatient
+        ? <IconData>[
+            Icons.grid_view_rounded,
+            Icons.folder_copy_outlined,
+            Icons.chat_bubble_outline
+          ]
+        : <IconData>[
+            Icons.grid_view_rounded,
+            Icons.radar_rounded,
+            Icons.folder_copy_outlined,
+            Icons.balance_rounded,
+            Icons.domain_rounded,
+            Icons.chat_bubble_outline
+          ];
+    if (widget.store.profile!.platformAdmin) {
+      pages.add(AdminPage(widget.store));
+      labels.add('Admin');
+      icons.add(Icons.admin_panel_settings_outlined);
+    }
     return Scaffold(
         body: SafeArea(
             child: Row(children: [
@@ -800,9 +1028,8 @@ class _HomeScreenState extends State<HomeScreen> {
                         icon: Icon(icons[i]), label: labels[i]))),
         floatingActionButton: widget.store.profile!.role == UserRole.hospital
             ? FloatingActionButton.extended(
-                onPressed: () => showDialog(
-                    context: context,
-                    builder: (_) => NewCaseDialog(widget.store)),
+                onPressed: () => Navigator.of(context).push(MaterialPageRoute(
+                    builder: (_) => CaseFormPage(store: widget.store))),
                 icon: const Icon(Icons.add),
                 label: const Text('New RAF case'))
             : null);
@@ -1432,26 +1659,43 @@ class CaseDetails extends StatefulWidget {
 
 class _CaseDetailsState extends State<CaseDetails> {
   @override
-  Widget build(BuildContext context) => AlertDialog(
-          title: Row(children: [
-            Expanded(
-                child: Text(widget.store.patientLabel(widget.item.patient))),
-            if (widget.store.privacyShield)
-              const Tooltip(
-                  message: 'Patient identity is masked',
-                  child: Icon(Icons.visibility_off, size: 20))
-          ]),
-          content: SizedBox(
-              width: 560,
-              child: SingleChildScrollView(
-                  child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                    Text(
-                        '${widget.item.id} · ${widget.item.hospital} · ${widget.item.city}'),
-                    const SizedBox(height: 18),
-                    SmartCaseInsight(widget.item),
-                    const SizedBox(height: 18),
+  Widget build(BuildContext context) {
+    final isPatient = widget.store.profile!.role == UserRole.patient;
+    return AlertDialog(
+        title: Row(children: [
+          Expanded(child: Text(widget.store.patientLabel(widget.item.patient))),
+          if (widget.store.privacyShield)
+            const Tooltip(
+                message: 'Patient identity is masked',
+                child: Icon(Icons.visibility_off, size: 20))
+        ]),
+        content: SizedBox(
+            width: 560,
+            child: SingleChildScrollView(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                  Text(
+                      '${widget.item.id} · ${widget.item.hospital} · ${widget.item.city}'),
+                  const SizedBox(height: 18),
+                  if (widget.store.profile!.role == UserRole.hospital) ...[
+                    OutlinedButton.icon(
+                        onPressed: editPatientDetails,
+                        icon: const Icon(Icons.edit_note),
+                        label: const Text('Edit patient details')),
+                    const SizedBox(height: 10),
+                  ],
+                  PatientDetailsPanel(widget.item),
+                  const SizedBox(height: 18),
+                  SmartCaseInsight(widget.item),
+                  const SizedBox(height: 18),
+                  if (isPatient)
+                    ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: const Icon(Icons.timeline),
+                        title: const Text('Case status'),
+                        subtitle: Text(widget.item.status))
+                  else
                     DropdownButtonFormField<String>(
                         initialValue: widget.item.status,
                         decoration:
@@ -1472,53 +1716,95 @@ class _CaseDetailsState extends State<CaseDetails> {
                           await widget.store.updateCase(
                               widget.item, '${widget.item.id} moved to $v');
                         }),
+                  if (!isPatient) ...[
                     const SizedBox(height: 12),
                     FollowUpControl(widget.store, widget.item, scheduleFollowUp,
                         clearFollowUp),
+                  ],
+                  const SizedBox(height: 18),
+                  if (BackendConfig.enabled && !isPatient) ...[
+                    CaseTaskPanel(widget.item),
                     const SizedBox(height: 18),
-                    const Text('Documents',
-                        style: TextStyle(fontWeight: FontWeight.w900)),
-                    const SizedBox(height: 8),
-                    EvidencePackAssistant(widget.item),
-                    const SizedBox(height: 8),
+                  ],
+                  const Text('Documents',
+                      style: TextStyle(fontWeight: FontWeight.w900)),
+                  const SizedBox(height: 8),
+                  EvidencePackAssistant(
+                      widget.store, widget.item, () => setState(() {})),
+                  const SizedBox(height: 8),
+                  if (BackendConfig.enabled)
+                    DocumentManager(widget.item)
+                  else
                     ...widget.item.documents.map((e) => ListTile(
                         leading: const Icon(Icons.description_outlined),
                         title: Text(e))),
-                    OutlinedButton.icon(
-                        onPressed: pickDocument,
-                        icon: const Icon(Icons.upload_file),
-                        label: const Text('Attach document')),
-                    const SizedBox(height: 18),
-                    const Text('Assigned lawyer',
-                        style: TextStyle(fontWeight: FontWeight.w900)),
-                    Text(widget.item.lawyer ?? 'Not assigned'),
-                    const SizedBox(height: 18),
-                    const Text('Case timeline',
-                        style: TextStyle(fontWeight: FontWeight.w900)),
-                    TimelineList(widget.item.timeline,
-                        redactDetails: widget.store.privacyShield),
-                  ]))),
-          actions: [
-            OutlinedButton.icon(
-                onPressed: copySummary,
-                icon: const Icon(Icons.content_copy),
-                label: const Text('Copy summary')),
-            TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('Close'))
-          ]);
-  Future<void> pickDocument() async {
+                  OutlinedButton.icon(
+                      onPressed: chooseAndAttachDocument,
+                      icon: const Icon(Icons.upload_file),
+                      label: const Text('Choose type and attach')),
+                  const SizedBox(height: 18),
+                  const Text('Assigned lawyer',
+                      style: TextStyle(fontWeight: FontWeight.w900)),
+                  Text(widget.item.lawyer ?? 'Not assigned'),
+                  const SizedBox(height: 18),
+                  const Text('Case timeline',
+                      style: TextStyle(fontWeight: FontWeight.w900)),
+                  TimelineList(widget.item.timeline,
+                      redactDetails: widget.store.privacyShield),
+                ]))),
+        actions: [
+          OutlinedButton.icon(
+              onPressed: copySummary,
+              icon: const Icon(Icons.content_copy),
+              label: const Text('Copy summary')),
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Close'))
+        ]);
+  }
+
+  Future<void> chooseAndAttachDocument() async {
+    final category = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) => SimpleDialog(
+                title: const Text('Which document are you attaching?'),
+                children: [
+                  ...widget.item.evidenceChecklist.keys.map((label) =>
+                      SimpleDialogOption(
+                          onPressed: () => Navigator.pop(dialogContext, label),
+                          child: ListTile(
+                              leading: Icon(widget.store
+                                      .evidenceComplete(widget.item, label)
+                                  ? Icons.check_circle
+                                  : Icons.description_outlined),
+                              title: Text(label)))),
+                  SimpleDialogOption(
+                      onPressed: () => Navigator.pop(dialogContext, 'Other'),
+                      child: const ListTile(
+                          leading: Icon(Icons.add),
+                          title: Text('Other supporting document')))
+                ]));
+    if (category != null) await pickDocument(category);
+  }
+
+  Future<void> pickDocument([String? category]) async {
     final result =
         await FilePicker.platform.pickFiles(withData: BackendConfig.enabled);
     if (result != null) {
       final file = result.files.single;
       if (BackendConfig.enabled && file.bytes != null) {
         await SupabaseService.uploadDocument(
-            caseId: widget.item.id, fileName: file.name, bytes: file.bytes!);
+            caseId: widget.item.id,
+            fileName: file.name,
+            bytes: file.bytes!,
+            category: category ?? 'Other');
       }
       setState(() => widget.item.documents.add(file.name));
-      await widget.store
-          .updateCase(widget.item, 'Document added to ${widget.item.id}');
+      if (category != null && category != 'Other') {
+        await widget.store.setEvidenceComplete(widget.item, category, true);
+      }
+      await widget.store.updateCase(
+          widget.item, '${category ?? 'Document'} added to ${widget.item.id}');
     }
   }
 
@@ -1542,6 +1828,13 @@ class _CaseDetailsState extends State<CaseDetails> {
     if (mounted) setState(() {});
   }
 
+  Future<void> editPatientDetails() async {
+    await Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) =>
+            CaseFormPage(store: widget.store, existing: widget.item)));
+    if (mounted) setState(() {});
+  }
+
   Future<void> copySummary() async {
     final item = widget.item;
     final summary = [
@@ -1562,11 +1855,12 @@ class _CaseDetailsState extends State<CaseDetails> {
         ...item.documents.map((document) => '- $document'),
       '',
       'Suggested evidence review:',
-      'Evidence detected: ${item.evidencePercent}%',
-      if (item.suggestedMissingEvidence.isEmpty)
+      'Evidence completed: ${widget.store.evidenceCompletion(item)}%',
+      if (widget.store.missingEvidence(item).isEmpty)
         '- No suggested gaps detected from filenames'
       else
-        ...item.suggestedMissingEvidence
+        ...widget.store
+            .missingEvidence(item)
             .map((document) => '- Review: $document'),
       '',
       'Latest messages:',
@@ -1597,6 +1891,222 @@ class _CaseDetailsState extends State<CaseDetails> {
 
   static String _dateLabel(DateTime value) =>
       '${value.year}-${value.month.toString().padLeft(2, '0')}-${value.day.toString().padLeft(2, '0')} ${value.hour.toString().padLeft(2, '0')}:${value.minute.toString().padLeft(2, '0')}';
+}
+
+class CaseTaskPanel extends StatefulWidget {
+  const CaseTaskPanel(this.item, {super.key});
+  final RafCase item;
+
+  @override
+  State<CaseTaskPanel> createState() => _CaseTaskPanelState();
+}
+
+class _CaseTaskPanelState extends State<CaseTaskPanel> {
+  List<Map<String, dynamic>> tasks = [], members = [];
+  bool loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    try {
+      final values = await Future.wait([
+        SupabaseService.fetchTasks(widget.item.id),
+        SupabaseService.fetchOrganisationMembers(),
+      ]);
+      if (mounted) {
+        setState(() {
+          tasks = values[0];
+          members = values[1];
+          loading = false;
+        });
+      }
+    } catch (error) {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  String memberName(String? id) {
+    if (id == null) return 'Unassigned';
+    final match = members.where((member) => member['user_id'] == id);
+    return match.isEmpty ? 'Assigned user' : match.first['display_name'];
+  }
+
+  @override
+  Widget build(BuildContext context) =>
+      Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Expanded(
+              child: Text('Case tasks',
+                  style: TextStyle(fontWeight: FontWeight.w900))),
+          TextButton.icon(
+              onPressed: createTask,
+              icon: const Icon(Icons.add_task),
+              label: const Text('Add task'))
+        ]),
+        if (loading)
+          const LinearProgressIndicator()
+        else if (tasks.isEmpty)
+          const Text('No tasks yet.', style: TextStyle(color: Colors.grey))
+        else
+          ...tasks.map((task) {
+            final complete = task['completed_at'] != null;
+            final due = DateTime.tryParse(task['due_at'] ?? '');
+            final overdue =
+                !complete && due != null && due.isBefore(DateTime.now());
+            return Card(
+                child: CheckboxListTile(
+                    value: complete,
+                    onChanged: (value) async {
+                      await SupabaseService.setTaskComplete(
+                          task['id'], value ?? false);
+                      await load();
+                    },
+                    title: Text(task['title'],
+                        style: TextStyle(
+                            fontWeight: FontWeight.w800,
+                            decoration:
+                                complete ? TextDecoration.lineThrough : null)),
+                    subtitle: Text(
+                        '${task['priority'].toString().toUpperCase()} · ${memberName(task['assigned_to'])}${due == null ? '' : ' · Due ${_date(due)}'}',
+                        style: TextStyle(color: overdue ? Colors.red : null)),
+                    secondary: IconButton(
+                        tooltip: 'Comments',
+                        onPressed: () => comments(task),
+                        icon: Badge(
+                            label: Text(
+                                '${(task['comments'] as List? ?? []).length}'),
+                            child: const Icon(Icons.comment_outlined)))));
+          })
+      ]);
+
+  Future<void> createTask() async {
+    final title = TextEditingController();
+    final description = TextEditingController();
+    var priority = 'medium';
+    String? assignee;
+    var due = DateTime.now().add(const Duration(days: 3));
+    final saved = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => StatefulBuilder(
+            builder: (context, setDialogState) => AlertDialog(
+                    title: const Text('Create case task'),
+                    content: SizedBox(
+                        width: 460,
+                        child:
+                            Column(mainAxisSize: MainAxisSize.min, children: [
+                          TextField(
+                              controller: title,
+                              decoration: const InputDecoration(
+                                  labelText: 'Task title')),
+                          const SizedBox(height: 10),
+                          TextField(
+                              controller: description,
+                              decoration: const InputDecoration(
+                                  labelText: 'Description / instructions')),
+                          const SizedBox(height: 10),
+                          DropdownButtonFormField<String>(
+                              initialValue: priority,
+                              decoration:
+                                  const InputDecoration(labelText: 'Priority'),
+                              items: ['low', 'medium', 'high', 'urgent']
+                                  .map((value) => DropdownMenuItem(
+                                      value: value,
+                                      child: Text(value.toUpperCase())))
+                                  .toList(),
+                              onChanged: (value) => priority = value!),
+                          const SizedBox(height: 10),
+                          DropdownButtonFormField<String?>(
+                              initialValue: assignee,
+                              decoration: const InputDecoration(
+                                  labelText: 'Assign to user'),
+                              items: [
+                                const DropdownMenuItem<String?>(
+                                    value: null, child: Text('Unassigned')),
+                                ...members.map((member) =>
+                                    DropdownMenuItem<String?>(
+                                        value: member['user_id'],
+                                        child: Text(member['display_name'])))
+                              ],
+                              onChanged: (value) => assignee = value),
+                          ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              leading: const Icon(Icons.event),
+                              title: const Text('Due date'),
+                              subtitle: Text(_date(due)),
+                              trailing: const Icon(Icons.edit_calendar),
+                              onTap: () async {
+                                final selected = await showDatePicker(
+                                    context: context,
+                                    initialDate: due,
+                                    firstDate: DateTime.now(),
+                                    lastDate: DateTime.now()
+                                        .add(const Duration(days: 1825)));
+                                if (selected != null) {
+                                  setDialogState(() => due = selected);
+                                }
+                              })
+                        ])),
+                    actions: [
+                      TextButton(
+                          onPressed: () => Navigator.pop(dialogContext, false),
+                          child: const Text('Cancel')),
+                      FilledButton(
+                          onPressed: () => Navigator.pop(dialogContext, true),
+                          child: const Text('Create task'))
+                    ])));
+    if (saved == true && title.text.trim().isNotEmpty) {
+      await SupabaseService.createTask(
+          caseId: widget.item.id,
+          title: title.text.trim(),
+          description: description.text.trim(),
+          priority: priority,
+          dueAt: due,
+          assignedTo: assignee);
+      await load();
+    }
+  }
+
+  Future<void> comments(Map<String, dynamic> task) async {
+    final text = TextEditingController();
+    await showDialog(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+                title: Text('Comments · ${task['title']}'),
+                content: SizedBox(
+                    width: 460,
+                    child: Column(mainAxisSize: MainAxisSize.min, children: [
+                      ...((task['comments'] as List? ?? []).map((comment) =>
+                          ListTile(
+                              leading: const Icon(Icons.chat_bubble_outline),
+                              title: Text(comment['body'])))),
+                      TextField(
+                          controller: text,
+                          decoration:
+                              const InputDecoration(labelText: 'Add a comment'))
+                    ])),
+                actions: [
+                  TextButton(
+                      onPressed: () => Navigator.pop(dialogContext),
+                      child: const Text('Close')),
+                  FilledButton(
+                      onPressed: () async {
+                        if (text.text.trim().isNotEmpty) {
+                          await SupabaseService.addTaskComment(
+                              task['id'], text.text.trim());
+                        }
+                        if (dialogContext.mounted) Navigator.pop(dialogContext);
+                      },
+                      child: const Text('Comment'))
+                ]));
+    await load();
+  }
+
+  static String _date(DateTime value) =>
+      '${value.day.toString().padLeft(2, '0')}/${value.month.toString().padLeft(2, '0')}/${value.year}';
 }
 
 class FollowUpControl extends StatelessWidget {
@@ -1696,9 +2206,181 @@ class SmartCaseInsight extends StatelessWidget {
   }
 }
 
-class EvidencePackAssistant extends StatelessWidget {
-  const EvidencePackAssistant(this.item, {super.key});
+class DocumentManager extends StatefulWidget {
+  const DocumentManager(this.item, {super.key});
   final RafCase item;
+
+  @override
+  State<DocumentManager> createState() => _DocumentManagerState();
+}
+
+class _DocumentManagerState extends State<DocumentManager> {
+  List<Map<String, dynamic>> documents = [];
+  bool loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    try {
+      final values = await SupabaseService.fetchDocuments(widget.item.id);
+      if (mounted) {
+        setState(() {
+          documents = values;
+          loading = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (loading) return const LinearProgressIndicator();
+    if (documents.isEmpty) {
+      return const Padding(
+          padding: EdgeInsets.symmetric(vertical: 8),
+          child: Text('No managed documents yet.',
+              style: TextStyle(color: Colors.grey)));
+    }
+    return Column(
+        children: documents
+            .map((document) => Card(
+                child: ListTile(
+                    leading: const CircleAvatar(
+                        child: Icon(Icons.description_outlined)),
+                    title: Text(document['file_name']),
+                    subtitle: Text(
+                        '${document['category'] ?? 'Other'} · v${document['version'] ?? 1}\nUploaded by ${document['uploader_name'] ?? 'Case participant'} · ${_date(document['created_at'])}'),
+                    isThreeLine: true,
+                    trailing: PopupMenuButton<String>(
+                        onSelected: (action) => handle(action, document),
+                        itemBuilder: (_) => const [
+                              PopupMenuItem(
+                                  value: 'open',
+                                  child: Text('Preview / download')),
+                              PopupMenuItem(
+                                  value: 'edit',
+                                  child: Text('Rename / categorise')),
+                              PopupMenuItem(
+                                  value: 'replace',
+                                  child: Text('Replace with new version')),
+                              PopupMenuItem(
+                                  value: 'history',
+                                  child: Text('Document history')),
+                            ]))))
+            .toList());
+  }
+
+  Future<void> handle(String action, Map<String, dynamic> document) async {
+    if (action == 'open') {
+      final url = await SupabaseService.documentUrl(document['storage_path']);
+      await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+      return;
+    }
+    if (action == 'replace') {
+      final result = await FilePicker.platform.pickFiles(withData: true);
+      if (result != null && result.files.single.bytes != null) {
+        await SupabaseService.replaceDocument(
+            previous: document,
+            fileName: result.files.single.name,
+            bytes: result.files.single.bytes!);
+        await load();
+      }
+      return;
+    }
+    if (action == 'history') {
+      final history =
+          await SupabaseService.fetchDocumentHistory(widget.item.id);
+      if (!mounted) return;
+      await showDialog(
+          context: context,
+          builder: (_) => AlertDialog(
+                  title: const Text('Document history'),
+                  content: SizedBox(
+                      width: 520,
+                      child: ListView(
+                          shrinkWrap: true,
+                          children: history
+                              .map((event) => ListTile(
+                                  leading: const Icon(Icons.history),
+                                  title: Text(event['action']),
+                                  subtitle: Text(event['detail'] ?? ''),
+                                  trailing: Text(_date(event['created_at']))))
+                              .toList())),
+                  actions: [
+                    TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text('Close'))
+                  ]));
+      return;
+    }
+    final name = TextEditingController(text: document['file_name']);
+    var category = document['category'] as String? ?? 'Other';
+    if (!mounted) return;
+    final save = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => StatefulBuilder(
+            builder: (context, setState) => AlertDialog(
+                    title: const Text('Document details'),
+                    content: SizedBox(
+                        width: 430,
+                        child:
+                            Column(mainAxisSize: MainAxisSize.min, children: [
+                          TextField(
+                              controller: name,
+                              decoration: const InputDecoration(
+                                  labelText: 'File name')),
+                          const SizedBox(height: 10),
+                          DropdownButtonFormField<String>(
+                              initialValue: category,
+                              decoration:
+                                  const InputDecoration(labelText: 'Category'),
+                              items: [
+                                ...widget.item.evidenceChecklist.keys,
+                                'Other'
+                              ]
+                                  .map((value) => DropdownMenuItem(
+                                      value: value, child: Text(value)))
+                                  .toList(),
+                              onChanged: (value) =>
+                                  setState(() => category = value!))
+                        ])),
+                    actions: [
+                      TextButton(
+                          onPressed: () => Navigator.pop(dialogContext, false),
+                          child: const Text('Cancel')),
+                      FilledButton(
+                          onPressed: () => Navigator.pop(dialogContext, true),
+                          child: const Text('Save'))
+                    ])));
+    if (save == true) {
+      await SupabaseService.updateDocument(
+          id: document['id'],
+          caseId: widget.item.id,
+          fileName: name.text.trim(),
+          category: category);
+      await load();
+    }
+  }
+
+  static String _date(dynamic raw) {
+    final value = DateTime.tryParse(raw?.toString() ?? '');
+    if (value == null) return '';
+    return '${value.day.toString().padLeft(2, '0')}/${value.month.toString().padLeft(2, '0')}/${value.year}';
+  }
+}
+
+class EvidencePackAssistant extends StatelessWidget {
+  const EvidencePackAssistant(this.store, this.item, this.onChanged,
+      {super.key});
+  final AppStore store;
+  final RafCase item;
+  final VoidCallback onChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -1715,7 +2397,7 @@ class EvidencePackAssistant extends StatelessWidget {
             const Expanded(
                 child: Text('Evidence-pack assistant',
                     style: TextStyle(fontWeight: FontWeight.w900))),
-            Text('${item.evidencePercent}%',
+            Text('${store.evidenceCompletion(item)}%',
                 style: const TextStyle(fontWeight: FontWeight.w900))
           ]),
           const SizedBox(height: 6),
@@ -1726,17 +2408,25 @@ class EvidencePackAssistant extends StatelessWidget {
           Wrap(
               spacing: 7,
               runSpacing: 7,
-              children: item.evidenceChecklist.entries
-                  .map((entry) => Chip(
-                      avatar: Icon(
-                          entry.value
-                              ? Icons.check_circle
-                              : Icons.radio_button_unchecked,
-                          size: 17,
-                          color: entry.value ? Colors.green : Colors.orange),
-                      label: Text(entry.key,
-                          style: const TextStyle(fontSize: 11))))
-                  .toList())
+              children: item.evidenceChecklist.keys.map((label) {
+                final complete = store.evidenceComplete(item, label);
+                return FilterChip(
+                    avatar: Icon(
+                        complete
+                            ? Icons.check_circle
+                            : Icons.radio_button_unchecked,
+                        size: 17,
+                        color: complete ? Colors.green : Colors.orange),
+                    selected: complete,
+                    onSelected: store.profile!.role != UserRole.admin
+                        ? (selected) async {
+                            await store.setEvidenceComplete(
+                                item, label, selected);
+                            onChanged();
+                          }
+                        : null,
+                    label: Text(label, style: const TextStyle(fontSize: 11)));
+              }).toList())
         ]));
   }
 }
@@ -1795,11 +2485,15 @@ class LawyersPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final city = store.profile!.city;
+    final canAssign = store.profile!.role == UserRole.hospital;
     final sorted = [...store.lawyers]
       ..sort((a, b) => store.match(b, city).compareTo(store.match(a, city)));
     return AppList(key: const ValueKey('lawyers'), children: [
-      Heading('Lawyers near $city',
-          'Matches explain location, RAF experience and availability.'),
+      Heading(
+          'Lawyers near $city',
+          canAssign
+              ? 'Matches explain location, RAF experience and availability.'
+              : 'View-only recommendations. Lawyers cannot assign other lawyers.'),
       ...sorted.map((e) => Padding(
           padding: const EdgeInsets.only(bottom: 10),
           child: LawyerCard(store, e, city)))
@@ -1861,11 +2555,16 @@ class LawyerCard extends StatelessWidget {
                     style: TextStyle(fontSize: 9, letterSpacing: 1.2))
               ]),
               const SizedBox(width: 10),
-              FilledButton(
-                  onPressed: lawyer.available && store.cases.isNotEmpty
-                      ? () => assign(context)
-                      : null,
-                  child: const Text('Assign'))
+              if (store.profile!.role == UserRole.hospital)
+                FilledButton(
+                    onPressed: lawyer.available && store.cases.isNotEmpty
+                        ? () => assign(context)
+                        : null,
+                    child: const Text('Assign'))
+              else
+                const Chip(
+                    avatar: Icon(Icons.visibility_outlined, size: 16),
+                    label: Text('View only'))
             ])));
   }
 
@@ -1992,6 +2691,131 @@ class RegisterSummary extends StatelessWidget {
                   ]))));
 }
 
+class AdminPage extends StatefulWidget {
+  const AdminPage(this.store, {super.key});
+  final AppStore store;
+  @override
+  State<AdminPage> createState() => _AdminPageState();
+}
+
+class _AdminPageState extends State<AdminPage> {
+  Map<String, dynamic>? data;
+  String? error;
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    try {
+      final value = await SupabaseService.fetchAdminDashboard();
+      if (mounted) {
+        setState(() {
+          data = value;
+          error = null;
+        });
+      }
+    } catch (value) {
+      if (mounted) setState(() => error = '$value');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (error != null) {
+      return AppList(children: [
+        const Heading('Administration', 'Platform governance and oversight.'),
+        EmptyState(Icons.error_outline, 'Could not load administration', error!)
+      ]);
+    }
+    if (data == null) return const Center(child: CircularProgressIndicator());
+    final organisations =
+        (data!['organisations'] as List).cast<Map<String, dynamic>>();
+    final users = (data!['users'] as List).cast<Map<String, dynamic>>();
+    final audits = (data!['audits'] as List).cast<Map<String, dynamic>>();
+    final professionalDocuments =
+        (data!['professionalDocuments'] as List? ?? [])
+            .cast<Map<String, dynamic>>();
+    return AppList(key: const ValueKey('admin'), children: [
+      const Heading('Administration',
+          'Approve organisations, suspend access and review activity.'),
+      Wrap(spacing: 12, runSpacing: 12, children: [
+        Metric(Icons.domain, '${organisations.length}', 'Organisations'),
+        Metric(Icons.people_outline, '${users.length}', 'Users'),
+        Metric(Icons.history, '${audits.length}', 'Audit events')
+      ]),
+      const SectionTitle('Organisation approvals'),
+      ...organisations.map(organisationTile),
+      const SectionTitle('Approval documents'),
+      if (professionalDocuments.isEmpty)
+        const EmptyState(Icons.badge_outlined, 'No approval documents',
+            'Hospitals and lawyers can attach professional documents when applying.')
+      else
+        ...professionalDocuments.map(professionalDocumentTile),
+      const SectionTitle('User access'),
+      ...users.map(userTile),
+      const SectionTitle('Audit activity'),
+      ...audits.map((audit) => ListTile(
+          leading: const Icon(Icons.manage_search),
+          title: Text(audit['action']),
+          subtitle:
+              Text('${audit['entity_type']} · ${audit['entity_id'] ?? ''}')))
+    ]);
+  }
+
+  Widget organisationTile(Map<String, dynamic> organisation) => Card(
+      child: ListTile(
+          title: Text(organisation['name'],
+              style: const TextStyle(fontWeight: FontWeight.w900)),
+          subtitle: Text('${organisation['type']} · ${organisation['city']}'),
+          trailing: Wrap(spacing: 6, children: [
+            FilterChip(
+                label: const Text('Approved'),
+                selected: organisation['verified'] == true,
+                onSelected: (value) =>
+                    setOrganisation(organisation, verified: value)),
+            FilterChip(
+                label: const Text('Suspended'),
+                selected: organisation['suspended'] == true,
+                onSelected: (value) =>
+                    setOrganisation(organisation, suspended: value))
+          ])));
+  Widget professionalDocumentTile(Map<String, dynamic> doc) => ListTile(
+      leading: const Icon(Icons.verified_user_outlined),
+      title: Text(doc['file_name'] ?? 'Approval document'),
+      subtitle: Text(
+          '${doc['category'] ?? 'Professional document'} · ${doc['uploader_name'] ?? ''}'),
+      trailing: IconButton(
+          tooltip: 'Preview document',
+          icon: const Icon(Icons.open_in_new),
+          onPressed: () => openProfessionalDocument(doc)));
+
+  Future<void> openProfessionalDocument(Map<String, dynamic> doc) async {
+    final url =
+        await SupabaseService.professionalDocumentUrl(doc['storage_path']);
+    await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+  }
+
+  Widget userTile(Map<String, dynamic> user) => ListTile(
+      title: Text(user['display_name']),
+      subtitle: Text(user['email'] ?? ''),
+      trailing: Switch(
+          value: user['suspended'] == true,
+          onChanged: (value) async {
+            await SupabaseService.setUserSuspended(user['user_id'], value);
+            await load();
+          }));
+  Future<void> setOrganisation(Map<String, dynamic> row,
+      {bool? verified, bool? suspended}) async {
+    await SupabaseService.setOrganisationState(
+        row['id'],
+        verified ?? row['verified'] == true,
+        suspended ?? row['suspended'] == true);
+    await load();
+  }
+}
+
 class MessagesPage extends StatelessWidget {
   const MessagesPage(this.store, {super.key});
   final AppStore store;
@@ -2072,75 +2896,386 @@ class _ChatDialogState extends State<ChatDialog> {
   }
 }
 
-class NewCaseDialog extends StatefulWidget {
-  const NewCaseDialog(this.store, {super.key});
-  final AppStore store;
+class PatientDetailsPanel extends StatelessWidget {
+  const PatientDetailsPanel(this.item, {super.key});
+  final RafCase item;
+
   @override
-  State<NewCaseDialog> createState() => _NewCaseDialogState();
+  Widget build(BuildContext context) => Card(
+      margin: const EdgeInsets.only(top: 12),
+      child: Padding(
+          padding: const EdgeInsets.all(14),
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Patient profile',
+                style: TextStyle(fontWeight: FontWeight.w900)),
+            const SizedBox(height: 8),
+            Wrap(spacing: 18, runSpacing: 8, children: [
+              DetailPill(Icons.email_outlined, item.patientEmail ?? 'No email'),
+              DetailPill(Icons.phone_outlined, item.patientPhone ?? 'No phone'),
+              DetailPill(Icons.badge_outlined,
+                  item.patientIdNumber ?? 'No ID / passport'),
+              DetailPill(Icons.cake_outlined, _date(item.patientDateOfBirth)),
+              DetailPill(Icons.event_outlined, _date(item.accidentDate)),
+            ]),
+            if ((item.patientAddress ?? '').isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text('Address: ${item.patientAddress}')
+            ],
+            if ((item.emergencyContactName ?? '').isNotEmpty ||
+                (item.emergencyContactPhone ?? '').isNotEmpty) ...[
+              const SizedBox(height: 6),
+              Text(
+                  'Emergency: ${item.emergencyContactName ?? ''} ${item.emergencyContactPhone ?? ''}')
+            ],
+            if ((item.accidentDescription ?? '').isNotEmpty) ...[
+              const SizedBox(height: 6),
+              Text('Accident notes: ${item.accidentDescription}')
+            ],
+          ])));
+
+  static String _date(DateTime? value) {
+    if (value == null) return 'No date';
+    return '${value.day.toString().padLeft(2, '0')}/${value.month.toString().padLeft(2, '0')}/${value.year}';
+  }
 }
 
-class _NewCaseDialogState extends State<NewCaseDialog> {
-  final patient = TextEditingController(), city = TextEditingController();
+class DetailPill extends StatelessWidget {
+  const DetailPill(this.icon, this.label, {super.key});
+  final IconData icon;
+  final String label;
+  @override
+  Widget build(BuildContext context) => Chip(
+      avatar: Icon(icon, size: 16),
+      label: Text(label, style: const TextStyle(fontSize: 12)));
+}
+
+class FormBox extends StatelessWidget {
+  const FormBox({super.key, required this.child, this.wide = false});
+  final Widget child;
+  final bool wide;
+  @override
+  Widget build(BuildContext context) => SizedBox(
+      width: wide ? 852 : 420,
+      child: Padding(padding: const EdgeInsets.only(bottom: 2), child: child));
+}
+
+class DatePickerTile extends StatelessWidget {
+  const DatePickerTile(
+      {super.key,
+      required this.label,
+      required this.value,
+      required this.onChanged});
+  final String label;
+  final DateTime? value;
+  final ValueChanged<DateTime> onChanged;
+
+  @override
+  Widget build(BuildContext context) => InkWell(
+      borderRadius: BorderRadius.circular(16),
+      onTap: () async {
+        final now = DateTime.now();
+        final selected = await showDatePicker(
+            context: context,
+            initialDate: value ?? now,
+            firstDate: DateTime(1900),
+            lastDate: DateTime(now.year + 1));
+        if (selected != null) onChanged(selected);
+      },
+      child: InputDecorator(
+          decoration: InputDecoration(
+              labelText: label,
+              suffixIcon: const Icon(Icons.calendar_month_outlined)),
+          child: Text(value == null
+              ? 'Select date'
+              : '${value!.day.toString().padLeft(2, '0')}/${value!.month.toString().padLeft(2, '0')}/${value!.year}')));
+}
+
+class CaseFormPage extends StatefulWidget {
+  const CaseFormPage({super.key, required this.store, this.existing});
+  final AppStore store;
+  final RafCase? existing;
+  @override
+  State<CaseFormPage> createState() => _CaseFormPageState();
+}
+
+class _CaseFormPageState extends State<CaseFormPage> {
   final form = GlobalKey<FormState>();
+  final patient = TextEditingController();
+  final patientEmail = TextEditingController();
+  final patientPhone = TextEditingController();
+  final patientIdNumber = TextEditingController();
+  final patientAddress = TextEditingController();
+  final emergencyName = TextEditingController();
+  final emergencyPhone = TextEditingController();
+  final city = TextEditingController();
+  final accidentDescription = TextEditingController();
+  DateTime? patientDob;
+  DateTime? accidentDate;
   bool recommend = true;
+  bool saving = false;
+
+  bool get editing => widget.existing != null;
+
   @override
   void initState() {
     super.initState();
-    city.text = widget.store.profile!.city;
+    final item = widget.existing;
+    if (item == null) {
+      city.text = widget.store.profile!.city;
+      accidentDate = DateTime.now();
+      return;
+    }
+    patient.text = item.patient;
+    patientEmail.text = item.patientEmail ?? '';
+    patientPhone.text = item.patientPhone ?? '';
+    patientIdNumber.text = item.patientIdNumber ?? '';
+    patientAddress.text = item.patientAddress ?? '';
+    emergencyName.text = item.emergencyContactName ?? '';
+    emergencyPhone.text = item.emergencyContactPhone ?? '';
+    city.text = item.city;
+    accidentDescription.text = item.accidentDescription ?? '';
+    patientDob = item.patientDateOfBirth;
+    accidentDate = item.accidentDate;
+    recommend = item.status == 'Lawyer matching';
   }
 
   @override
-  Widget build(BuildContext context) => AlertDialog(
-          title: const Text('Create RAF case'),
-          content: SizedBox(
-              width: 480,
-              child: Form(
-                  key: form,
-                  child: Column(mainAxisSize: MainAxisSize.min, children: [
-                    TextFormField(
-                        controller: patient,
-                        decoration: const InputDecoration(
-                            labelText: 'Patient full name'),
-                        validator: (v) =>
-                            (v ?? '').trim().isEmpty ? 'Required' : null),
-                    const SizedBox(height: 12),
-                    TextFormField(
-                        controller: city,
-                        decoration: const InputDecoration(
-                            labelText: 'Accident city / location'),
-                        validator: (v) =>
-                            (v ?? '').trim().isEmpty ? 'Required' : null),
-                    SwitchListTile(
-                        value: recommend,
-                        onChanged: (v) => setState(() => recommend = v),
-                        title: const Text('Recommend nearby RAF lawyers'))
-                  ]))),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('Cancel')),
-            FilledButton(
-                onPressed: create, child: const Text('Create secure case'))
-          ]);
-  Future<void> create() async {
+  void dispose() {
+    patient.dispose();
+    patientEmail.dispose();
+    patientPhone.dispose();
+    patientIdNumber.dispose();
+    patientAddress.dispose();
+    emergencyName.dispose();
+    emergencyPhone.dispose();
+    city.dispose();
+    accidentDescription.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+      appBar: AppBar(
+          title: Text(editing ? 'Edit patient details' : 'Create RAF case')),
+      body: SafeArea(
+          child: Center(
+              child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 920),
+                  child: Form(
+                      key: form,
+                      child: ListView(
+                          padding: const EdgeInsets.all(24),
+                          children: [
+                            Heading(
+                                editing
+                                    ? 'Update patient information'
+                                    : 'New RAF case',
+                                editing
+                                    ? 'Correct patient details, especially the login email, when information was captured incorrectly.'
+                                    : 'Capture complete patient and accident details so the patient can later log in securely.'),
+                            const SectionTitle('Patient details'),
+                            Wrap(runSpacing: 12, spacing: 12, children: [
+                              FormBox(
+                                  child: TextFormField(
+                                      controller: patient,
+                                      decoration: const InputDecoration(
+                                          labelText: 'Patient full name'),
+                                      validator: required)),
+                              FormBox(
+                                  child: TextFormField(
+                                      controller: patientEmail,
+                                      keyboardType: TextInputType.emailAddress,
+                                      decoration: const InputDecoration(
+                                          labelText:
+                                              'Patient email for patient login'),
+                                      validator: emailRequired)),
+                              FormBox(
+                                  child: TextFormField(
+                                      controller: patientPhone,
+                                      keyboardType: TextInputType.phone,
+                                      decoration: const InputDecoration(
+                                          labelText: 'Patient phone number'),
+                                      validator: required)),
+                              FormBox(
+                                  child: TextFormField(
+                                      controller: patientIdNumber,
+                                      decoration: const InputDecoration(
+                                          labelText: 'ID / passport number'),
+                                      validator: required)),
+                              FormBox(
+                                  child: DatePickerTile(
+                                      label: 'Date of birth',
+                                      value: patientDob,
+                                      onChanged: (value) =>
+                                          setState(() => patientDob = value))),
+                              FormBox(
+                                  wide: true,
+                                  child: TextFormField(
+                                      controller: patientAddress,
+                                      minLines: 2,
+                                      maxLines: 3,
+                                      decoration: const InputDecoration(
+                                          labelText: 'Residential address'),
+                                      validator: required)),
+                            ]),
+                            const SectionTitle('Emergency contact'),
+                            Wrap(runSpacing: 12, spacing: 12, children: [
+                              FormBox(
+                                  child: TextFormField(
+                                      controller: emergencyName,
+                                      decoration: const InputDecoration(
+                                          labelText: 'Emergency contact name'),
+                                      validator: required)),
+                              FormBox(
+                                  child: TextFormField(
+                                      controller: emergencyPhone,
+                                      keyboardType: TextInputType.phone,
+                                      decoration: const InputDecoration(
+                                          labelText: 'Emergency contact phone'),
+                                      validator: required)),
+                            ]),
+                            const SectionTitle('Accident details'),
+                            Wrap(runSpacing: 12, spacing: 12, children: [
+                              FormBox(
+                                  child: TextFormField(
+                                      controller: city,
+                                      decoration: const InputDecoration(
+                                          labelText:
+                                              'Accident city / location'),
+                                      validator: required)),
+                              FormBox(
+                                  child: DatePickerTile(
+                                      label: 'Accident date',
+                                      value: accidentDate,
+                                      onChanged: (value) => setState(
+                                          () => accidentDate = value))),
+                              FormBox(
+                                  wide: true,
+                                  child: TextFormField(
+                                      controller: accidentDescription,
+                                      minLines: 3,
+                                      maxLines: 5,
+                                      decoration: const InputDecoration(
+                                          labelText:
+                                              'Brief accident description / notes'),
+                                      validator: required)),
+                            ]),
+                            const SizedBox(height: 12),
+                            if (!editing)
+                              SwitchListTile(
+                                  value: recommend,
+                                  onChanged: (v) =>
+                                      setState(() => recommend = v),
+                                  title: const Text(
+                                      'Recommend nearby RAF lawyers'),
+                                  subtitle: const Text(
+                                      'The case will start in lawyer matching.')),
+                            const SizedBox(height: 22),
+                            Row(children: [
+                              OutlinedButton(
+                                  onPressed: saving
+                                      ? null
+                                      : () => Navigator.pop(context),
+                                  child: const Text('Cancel')),
+                              const SizedBox(width: 12),
+                              FilledButton.icon(
+                                  onPressed: saving ? null : save,
+                                  icon: saving
+                                      ? const SizedBox.square(
+                                          dimension: 16,
+                                          child: CircularProgressIndicator(
+                                              strokeWidth: 2))
+                                      : const Icon(Icons.save),
+                                  label: Text(editing
+                                      ? 'Save patient updates'
+                                      : 'Create secure RAF case'))
+                            ])
+                          ]))))));
+
+  static String? required(String? value) =>
+      (value ?? '').trim().isEmpty ? 'Required' : null;
+  static String? emailRequired(String? value) {
+    final email = (value ?? '').trim();
+    if (email.isEmpty) return 'Required for patient login';
+    return email.contains('@') ? null : 'Enter a valid email';
+  }
+
+  Future<void> save() async {
     if (!form.currentState!.validate()) return;
-    final id =
-        'HC-RAF-${DateTime.now().millisecondsSinceEpoch.toString().substring(7)}';
-    final item = RafCase(
-        id: id,
-        patient: patient.text.trim(),
-        hospital: widget.store.profile!.organisation,
-        city: city.text.trim(),
-        status: recommend ? 'Lawyer matching' : 'New referral',
-        created: DateTime.now());
-    await widget.store.addCase(item);
-    if (mounted) Navigator.pop(context);
+    if (patientDob == null || accidentDate == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Please select date of birth and accident date.')));
+      return;
+    }
+    setState(() => saving = true);
+    try {
+      final existing = widget.existing;
+      if (existing == null) {
+        final id =
+            'HC-RAF-${DateTime.now().millisecondsSinceEpoch.toString().substring(7)}';
+        final item = RafCase(
+            id: id,
+            patient: patient.text.trim(),
+            hospital: widget.store.profile!.organisation,
+            city: city.text.trim(),
+            status: recommend ? 'Lawyer matching' : 'New referral',
+            created: DateTime.now(),
+            patientEmail: patientEmail.text.trim(),
+            patientPhone: patientPhone.text.trim(),
+            patientIdNumber: patientIdNumber.text.trim(),
+            patientDateOfBirth: patientDob,
+            patientAddress: patientAddress.text.trim(),
+            emergencyContactName: emergencyName.text.trim(),
+            emergencyContactPhone: emergencyPhone.text.trim(),
+            accidentDate: accidentDate,
+            accidentDescription: accidentDescription.text.trim());
+        await widget.store.addCase(item);
+      } else {
+        existing.patient = patient.text.trim();
+        existing.patientEmail = patientEmail.text.trim();
+        existing.patientPhone = patientPhone.text.trim();
+        existing.patientIdNumber = patientIdNumber.text.trim();
+        existing.patientDateOfBirth = patientDob;
+        existing.patientAddress = patientAddress.text.trim();
+        existing.emergencyContactName = emergencyName.text.trim();
+        existing.emergencyContactPhone = emergencyPhone.text.trim();
+        existing.city = city.text.trim();
+        existing.accidentDate = accidentDate;
+        existing.accidentDescription = accidentDescription.text.trim();
+        await widget.store
+            .updateCase(existing, 'Patient details updated for ${existing.id}');
+      }
+      if (mounted) Navigator.pop(context);
+    } finally {
+      if (mounted) setState(() => saving = false);
+    }
   }
 }
 
-class Notices extends StatelessWidget {
+class Notices extends StatefulWidget {
   const Notices(this.store, {super.key});
   final AppStore store;
+  @override
+  State<Notices> createState() => _NoticesState();
+}
+
+class _NoticesState extends State<Notices> {
+  List<Map<String, dynamic>> remote = [];
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    if (!BackendConfig.enabled) return;
+    try {
+      final values = await SupabaseService.fetchNotifications();
+      if (mounted) setState(() => remote = values);
+    } catch (_) {}
+  }
+
   @override
   Widget build(BuildContext context) => SafeArea(
       child: Padding(
@@ -2153,12 +3288,24 @@ class Notices extends StatelessWidget {
                     style:
                         TextStyle(fontSize: 22, fontWeight: FontWeight.w900)),
                 const SizedBox(height: 10),
-                if (store.notices.isEmpty)
+                if (remote.isEmpty && widget.store.notices.isEmpty)
                   const Text('You are all caught up.')
-                else
-                  ...store.notices.take(8).map((e) => ListTile(
+                else ...[
+                  ...remote.map((notice) => ListTile(
+                      leading: Icon(notice['read_at'] == null
+                          ? Icons.notifications_active
+                          : Icons.notifications_none),
+                      title: Text(notice['title']),
+                      subtitle: Text(notice['body'] ?? ''),
+                      onTap: () async {
+                        await SupabaseService.markNotificationRead(
+                            notice['id']);
+                        await load();
+                      })),
+                  ...widget.store.notices.take(8).map((e) => ListTile(
                       leading: const Icon(Icons.notifications_none),
                       title: Text(e)))
+                ]
               ])));
 }
 
@@ -2218,26 +3365,17 @@ class BrandMark extends StatelessWidget {
   @override
   Widget build(BuildContext context) => SizedBox.square(
       dimension: size,
-      child: DecoratedBox(
-          decoration: BoxDecoration(
-              color: translucent
-                  ? Colors.white.withValues(alpha: .16)
-                  : const Color(0xFF0A376A),
-              borderRadius: BorderRadius.circular(size * .27)),
-          child: Stack(alignment: Alignment.center, children: [
-            Container(
-                width: size * .68,
-                height: size * .23,
-                decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(size))),
-            Container(
-                width: size * .23,
-                height: size * .68,
-                decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(size))),
-            Icon(Icons.favorite_rounded,
-                size: size * .42, color: const Color(0xFFFF5C55))
-          ])));
+      child: ClipRRect(
+          borderRadius: BorderRadius.circular(size * .27),
+          child: Image.asset('assets/images/health_connect_logo.png',
+              fit: BoxFit.cover,
+              filterQuality: FilterQuality.high,
+              errorBuilder: (_, __, ___) => DecoratedBox(
+                  decoration: BoxDecoration(
+                      color: translucent
+                          ? Colors.white.withValues(alpha: .16)
+                          : const Color(0xFF0A376A),
+                      borderRadius: BorderRadius.circular(size * .27)),
+                  child: Icon(Icons.local_hospital,
+                      size: size * .52, color: Colors.white)))));
 }
